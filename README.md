@@ -392,6 +392,330 @@ requests.post(
 
 ---
 
+## Building Applications on Coral
+
+A Coral application is a backend service that orchestrates multi-agent sessions, manages threads, streams results to end users, and optionally injects human input mid-session. Your app talks to Coral Server over REST. Agents run autonomously — your app kickstarts them, monitors progress, and handles output.
+
+### Architecture
+
+```
+Your App (Node.js / Python / any)
+       │
+       ├── REST ──────── create sessions, manage namespaces, read state
+       ├── Puppet API ── inject messages, add participants mid-session
+       ├── SSE/WS ─────── stream live events to your UI
+       └── Webhooks ───── react to session completion
+              │
+       Coral Server  (localhost:5555 or api.coralcloud.ai)
+              │
+       ┌──────┴───────┐
+   Agent-1         Agent-2    ← MCP protocol (your app never speaks MCP directly)
+```
+
+---
+
+### Minimal client — Node.js
+
+```js
+// coral.js — Node 18+ (native fetch)
+const BASE = process.env.CORAL_SERVER_URL ?? 'http://localhost:5555';
+const KEY  = process.env.CORAL_API_KEY    ?? 'dev';
+const H    = { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' };
+
+async function req(method, path, body) {
+  const res = await fetch(`${BASE}/api/v1${path}`, {
+    method,
+    headers: H,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw Object.assign(new Error(`Coral ${res.status}`), { status: res.status, body: text });
+  }
+  return method === 'DELETE' ? null : res.json();
+}
+
+export const coral = {
+  // Sessions
+  createSession:  (body)           => req('POST',   '/local/session', body),
+  getSession:     (ns, id)         => req('GET',    `/local/session/${ns}/${id}`),
+  getSessionExt:  (ns, id)         => req('GET',    `/local/session/${ns}/${id}/extended`),
+  executeSession: (ns, id)         => req('POST',   `/local/session/${ns}/${id}`, { runtimeSettings: {} }),
+  closeSession:   (ns, id)         => req('DELETE', `/local/session/${ns}/${id}`),
+
+  // Puppet (your app acts as an agent)
+  createThread:   (ns, sid, agent, body) => req('POST', `/puppet/${ns}/${sid}/${agent}/thread`, body),
+  sendMessage:    (ns, sid, agent, body) => req('POST', `/puppet/${ns}/${sid}/${agent}/thread/message`, body),
+  addParticipant: (ns, sid, agent, body) => req('POST', `/puppet/${ns}/${sid}/${agent}/thread/participant`, body),
+
+  // Registry
+  listAgents: () => req('GET', '/registry'),
+};
+```
+
+---
+
+### Minimal client — Python
+
+```python
+# coral.py
+import os
+import requests
+
+BASE = os.environ.get('CORAL_SERVER_URL', 'http://localhost:5555')
+KEY  = os.environ.get('CORAL_API_KEY', 'dev')
+
+_s = requests.Session()
+_s.headers.update({'Authorization': f'Bearer {KEY}'})
+
+def _req(method, path, **kw):
+    r = _s.request(method, f'{BASE}/api/v1{path}', **kw)
+    r.raise_for_status()
+    return r.json() if r.content else None
+
+# Sessions
+create_session  = lambda body: _req('POST', '/local/session', json=body)
+get_session     = lambda ns, sid: _req('GET', f'/local/session/{ns}/{sid}')
+get_session_ext = lambda ns, sid: _req('GET', f'/local/session/{ns}/{sid}/extended')
+execute_session = lambda ns, sid: _req('POST', f'/local/session/{ns}/{sid}', json={'runtimeSettings': {}})
+close_session   = lambda ns, sid: _req('DELETE', f'/local/session/{ns}/{sid}')
+
+# Puppet
+create_thread   = lambda ns, sid, agent, body: _req('POST', f'/puppet/{ns}/{sid}/{agent}/thread', json=body)
+send_message    = lambda ns, sid, agent, body: _req('POST', f'/puppet/{ns}/{sid}/{agent}/thread/message', json=body)
+add_participant = lambda ns, sid, agent, body: _req('POST', f'/puppet/{ns}/{sid}/{agent}/thread/participant', json=body)
+
+# Registry
+list_agents = lambda: _req('GET', '/registry')
+```
+
+---
+
+### Complete application flow
+
+```js
+import { coral } from './coral.js';
+
+async function runJob(userPrompt) {
+  // 1. Create a deferred session (agents defined but not yet launched)
+  const { namespace, sessionId } = await coral.createSession({
+    namespace: 'my-app',
+    agents: [
+      {
+        agentName: 'orchestrator',
+        registrySource: 'local',
+        agentRegistryName: 'my-orchestrator',
+        agentRegistryVersion: '1.0.0',
+        options: { MODEL_API_KEY: process.env.OPENAI_API_KEY },
+      },
+      {
+        agentName: 'worker',
+        registrySource: 'local',
+        agentRegistryName: 'my-worker',
+        agentRegistryVersion: '1.0.0',
+        options: { MODEL_API_KEY: process.env.OPENAI_API_KEY },
+      },
+    ],
+    settings: { deferred: true, persistenceMode: 'HoldAfterExit' },
+  });
+
+  // 2. Create the entry thread and inject the task before agents launch
+  const { threadId } = await coral.createThread(namespace, sessionId, 'orchestrator', {
+    threadName: 'main',
+    participantNames: ['orchestrator', 'worker'],
+  });
+
+  await coral.sendMessage(namespace, sessionId, 'orchestrator', {
+    threadId,
+    content: userPrompt,
+    mentions: ['orchestrator'],
+  });
+
+  // 3. Launch agents — they start reading thread history immediately on connect
+  await coral.executeSession(namespace, sessionId);
+
+  return { namespace, sessionId, threadId };
+}
+```
+
+---
+
+### Real-time event streaming (SSE)
+
+Subscribe to live session events from your backend, then forward them to your frontend via WebSocket or HTTP streaming:
+
+```js
+import { EventSource } from 'eventsource';  // npm install eventsource (or use native in browsers)
+
+function streamSession(namespace, sessionId, onEvent) {
+  const es = new EventSource(`${BASE}/sse/${namespace}/${sessionId}`, {
+    headers: { Authorization: `Bearer ${KEY}` },
+  });
+
+  es.onmessage = (e) => {
+    const event = JSON.parse(e.data);
+    onEvent(event);
+  };
+  es.onerror = () => es.close();
+
+  return () => es.close();  // call to stop streaming
+}
+```
+
+**Event types and when to use them:**
+
+| Event | Use it to... |
+|-------|-------------|
+| `AgentConnected` | Confirm all agents joined before injecting human input |
+| `ThreadMessageSent` | Stream message content to your UI as it arrives |
+| `AgentWaitStart` | Show a per-agent "thinking…" spinner |
+| `AgentWaitStop` | Dismiss the spinner when the agent unblocks |
+| `ThreadCreated` | Track sub-tasks as agents create new threads dynamically |
+
+WebSocket is also available at `ws://localhost:5555/ws/{namespace}/{sessionId}` — same events, bidirectional channel.
+
+---
+
+### Human-in-the-loop
+
+Inject a user response into a running session. Your app participates as a named puppet — no agent process needed:
+
+```js
+async function injectUserReply(namespace, sessionId, threadId, userText, targetAgent = 'orchestrator') {
+  // Ensure the human participant exists in this thread
+  await coral.addParticipant(namespace, sessionId, 'human', {
+    threadId,
+    participantName: 'human',
+  }).catch(() => {});  // ignore if already a participant
+
+  await coral.sendMessage(namespace, sessionId, 'human', {
+    threadId,
+    content: userText,
+    mentions: [targetAgent],
+  });
+}
+```
+
+The target agent's `coral_wait_for_message` unblocks the instant the message arrives — no polling needed on the agent side.
+
+**Tip:** Listen for `AgentWaitStart` on the SSE stream to know which agent is waiting for human input, then call `injectUserReply` from your UI action.
+
+---
+
+### Webhook: react to session completion
+
+Pass a `webhookUrl` at session creation to receive a POST when the session closes:
+
+```js
+await coral.createSession({
+  namespace: 'my-app',
+  agents: [...],
+  settings: {
+    persistenceMode: 'HoldAfterExit',
+    webhookUrl: 'https://your-app.example.com/webhooks/coral',
+  },
+});
+```
+
+In your webhook handler, fetch the full session state to extract results:
+
+```js
+// POST /webhooks/coral
+app.post('/webhooks/coral', async (req, res) => {
+  const { namespace, sessionId } = req.body;
+  const session = await coral.getSessionExt(namespace, sessionId);
+  // session.threads[].messages[] contains the full conversation history
+  await processResults(session);
+  await coral.closeSession(namespace, sessionId);  // release from HoldAfterExit
+  res.sendStatus(200);
+});
+```
+
+---
+
+### Multi-tenant: namespace per user
+
+Isolate every user's agents in their own namespace — sessions can't bleed across:
+
+```js
+async function runUserJob(userId, prompt) {
+  const ns = `user-${userId}`;
+  const { sessionId, threadId } = await runJob(prompt, ns);
+  return { ns, sessionId, threadId };
+}
+
+async function cleanupUser(userId) {
+  // Deletes the namespace and closes all sessions inside it
+  await fetch(`${BASE}/api/v1/local/namespace/user-${userId}`, {
+    method: 'DELETE', headers: H,
+  });
+}
+```
+
+Create the namespace with `deleteOnLastSessionExit: true` and it auto-cleans when the last session closes:
+
+```js
+await fetch(`${BASE}/api/v1/local/namespace`, {
+  method: 'POST',
+  headers: H,
+  body: JSON.stringify({ name: `user-${userId}`, deleteOnLastSessionExit: true }),
+});
+```
+
+---
+
+### Polling (when SSE is unavailable)
+
+```js
+async function waitForDone(namespace, sessionId, { pollMs = 2000, timeoutMs = 300_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { status } = await coral.getSession(namespace, sessionId);
+    if (status !== 'Running') return status;
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  throw new Error(`Session ${sessionId} timed out after ${timeoutMs}ms`);
+}
+```
+
+---
+
+### Error handling
+
+```js
+try {
+  await coral.createSession(body);
+} catch (err) {
+  switch (err.status) {
+    case 400: // bad request — agent option type mismatch, or malformed session spec
+    case 403: // invalid API key
+    case 404: // agent not in registry, or session already deleted
+  }
+}
+```
+
+| Status | Cause | Fix |
+|--------|-------|-----|
+| `400` | Agent option type mismatch (string passed for `i32`) | Match types declared in `coral-agent.toml` |
+| `403` | Wrong API key, or management key used on agent-rpc | Check `CORAL_API_KEY` env var |
+| `404` on session | Session auto-deleted (`persistenceMode: None`) | Switch to `HoldAfterExit` if results needed after close |
+| `404` on registry | Agent not registered | Run `npx @coral-protocol/coralizer@latest link .` from the agent dir |
+
+---
+
+### Production checklist
+
+- [ ] Each tenant/user gets its own namespace — never share a `default` namespace across users
+- [ ] `persistenceMode: HoldAfterExit` on any session whose results your app needs post-close
+- [ ] `MODEL_API_KEY` passed as a session option, never hardcoded in `coral-agent.toml`
+- [ ] `CORAL_API_KEY` in env var, not in source
+- [ ] Webhook endpoint validates payload before processing
+- [ ] Session cleanup: `DELETE /local/session/{ns}/{id}` after reading results (releases `HoldAfterExit`)
+- [ ] Agents designed to loop on `coral_wait_for_message` — it times out at 60s
+- [ ] Namespace auto-delete enabled (`deleteOnLastSessionExit: true`) for ephemeral workloads
+
+---
+
 ## Key Data Structures
 
 ### SessionRequest
